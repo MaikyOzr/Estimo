@@ -1,0 +1,25 @@
+﻿version: "3.9"
+services:
+  estimo-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: estimo
+      POSTGRES_PASSWORD: estimo
+      POSTGRES_DB: estimo
+    ports: ["5432:5432"]
+    volumes: [ "estimo_pg:/var/lib/postgresql/data" ]
+
+  estimo.api:
+    build:
+      context: .
+      dockerfile: Estimo.Api/Dockerfile
+    image: estimoapi:latest
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__pg: Host=estimo-postgres;Database=estimo;Username=estimo;Password=estimo
+    depends_on: [ estimo-postgres ]
+    ports: [ "5000:8080" ]
+
+volumes:
+  estimo_pg:

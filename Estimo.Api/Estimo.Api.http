@@ -1,0 +1,6 @@
+@Estimo.Api_HostAddress = http://localhost:5197
+
+GET {{Estimo.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
