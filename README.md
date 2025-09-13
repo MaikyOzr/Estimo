@@ -1,4 +1,4 @@
-Estimo — Quotes/Invoices MVP (.NET 8, Minimal API, CQS)
+#Estimo — Quotes/Invoices MVP (.NET 8, Minimal API, CQS)
 
 Small SaaS MVP for creating clients and quotes, exporting PDFs, and protecting data per user (JWT).
 Tech: .NET 8, Minimal API, CQS-style handlers, EF Core + PostgreSQL, Serilog (JSON), QuestPDF.
