@@ -1,4 +1,4 @@
-using Estimo.Application.Features.Auth;
+﻿using Estimo.Application.Features.Auth;
 using Estimo.Application.Features.Client.Command;
 using Estimo.Application.Features.Client.Query;
 using Estimo.Application.Features.Client.Request;
@@ -10,15 +10,18 @@ using Estimo.Domain;
 using Estimo.Infrastructure;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using QuestPDF.Infrastructure;
 using Serilog;
+using Stripe;
+using Stripe.Checkout;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
+using System.Threading.RateLimiting;
 
 
 QuestPDF.Settings.License = LicenseType.Community;
@@ -32,6 +35,16 @@ builder.Host.UseSerilog((ctx, lc) => lc
 builder.Services.AddHealthChecks();
 builder.Services.AddAuthorization();
 builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddRateLimiter(o =>
+{
+    o.AddFixedWindowLimiter("tight", opts =>
+    {
+        opts.Window = TimeSpan.FromSeconds(10);
+        opts.PermitLimit = 50;
+        opts.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        opts.QueueLimit = 0;
+    });
+});
 
 builder.Services.AddSwaggerGen(x =>
 {
@@ -63,15 +76,17 @@ builder.Services.AddScoped<GetClientByIIdQuery>();
 builder.Services.AddScoped<CreateQuoteCommand>();
 builder.Services.AddScoped<GetQuoteByIdQuery>();
 builder.Services.AddScoped<QuotePdfService>();
-builder.Services.AddCors(options =>
-{
-    options.AddDefaultPolicy(policy =>
-    {
-        policy.AllowAnyOrigin()
-              .AllowAnyHeader()
-              .AllowAnyMethod();
-    });
-});
+var origins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
+              ?? new[] { "http://localhost:5173" };
+
+builder.Services.AddCors(o => o.AddPolicy("allow-ui", p => p
+    .WithOrigins(origins)
+    .AllowAnyHeader()
+    .AllowAnyMethod()
+    .WithExposedHeaders("X-Request-ID")));
+
+
+
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<ICurrentUser, CurrentUser>();
 builder.Services.AddScoped<IAuthService, AuthService>();
@@ -97,6 +112,10 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         };
     });
 
+var stripe = builder.Configuration.GetSection("Stripe");
+StripeConfiguration.ApiKey = stripe["ApiKey"];
+
+
 var app = builder.Build();
 
 using (var scope = app.Services.CreateScope())
@@ -105,7 +124,6 @@ using (var scope = app.Services.CreateScope())
     db.Database.Migrate();
 }
 
-// Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
@@ -130,7 +148,7 @@ app.Use(async (ctx, next) =>
     await next();
 });
 
-
+app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 
@@ -151,12 +169,57 @@ app.UseAuthorization();
     return (new JwtSecurityTokenHandler().WriteToken(jwtToken), jwtToken.ValidTo);
 }
 
+static (int dailyCap, bool unlimited) PlanCaps(string plan) => plan switch
+{
+    "business" => (int.MaxValue, true),
+    "pro" => (100, false),
+    _ => (5, false) // free
+};
+
+static async Task<(bool allowed, string reason)> CanGenerateAsync(EstimoDbContext db, Guid userId, CancellationToken ct)
+{
+    var billing = await db.UserBillings.FindAsync(new object[] { userId }, ct)
+                  ?? new UserBilling { UserId = userId, Plan = "free" };
+
+    // якщо період сабскрипції закінчився — повертаємося на free
+    if (billing.CurrentPeriodEndUtc is DateTime end && end < DateTime.UtcNow)
+        billing.Plan = "free";
+
+    var usage = await db.UserUsages.FindAsync(new object[] { userId }, ct)
+                ?? new UserUsage { UserId = userId };
+
+    var today = DateOnly.FromDateTime(DateTime.UtcNow);
+    if (usage.WindowDate != today) { usage.WindowDate = today; usage.DailyCount = 0; }
+
+    var (cap, unlimited) = PlanCaps(billing.Plan);
+
+    if (billing.Plan == "free")
+    {
+        if (usage.TotalCount < 15) return (true, "");
+        if (usage.DailyCount >= 5) return (false, "Daily free limit reached (5/day).");
+        return (true, "");
+    }
+
+    if (!unlimited && usage.DailyCount >= cap) return (false, $"Daily limit reached ({cap}/day).");
+    return (true, "");
+}
+
+static void CommitGenerate(EstimoDbContext db, Guid userId)
+{
+    var usage = db.UserUsages.Find(userId) ?? new UserUsage { UserId = userId };
+    var today = DateOnly.FromDateTime(DateTime.UtcNow);
+    if (usage.WindowDate != today) { usage.WindowDate = today; usage.DailyCount = 0; }
+    usage.TotalCount += 1;
+    usage.DailyCount += 1;
+    db.UserUsages.Update(usage);
+}
+
 app.MapHealthChecks("/health");
-app.UseCors();
+app.UseCors("allow-ui");
 var clientsMap = app.MapGroup("/clients").RequireAuthorization();
 var quoteMap = app.MapGroup("/quotes").RequireAuthorization();
 var authMap = app.MapGroup("/auth").AllowAnonymous();
-
+var billing = app.MapGroup("/billing").RequireAuthorization();
 
 authMap.MapPost("/register", async (RegisterRequest req, IAuthService auth, CancellationToken ct) =>
 {
@@ -193,17 +256,233 @@ quoteMap.MapPost("/", async (CreateQuoteRequest request, CreateQuoteCommand comm
     return Results.Created($"/quotes/{quote.Id}", quote);
 });
 
+quoteMap.MapPost("/{id:guid}/paylink", async (
+    Guid id,
+    EstimoDbContext db,
+    ICurrentUser cur,
+    CancellationToken ct) =>
+{
+    // 1) дістаємо квоту + перевіряємо власника
+    var data = await (from q in db.Quotes
+                      join c in db.Clients on q.ClientId equals c.Id
+                      where q.Id == id && c.OwnerId == cur.Id
+                      select new { q, c }).FirstOrDefaultAsync(ct);
+    if (data is null) return Results.NotFound();
+
+    // 2) total у євро → у центи
+    var total = data.q.Amount + data.q.Amount * data.q.VatPercent / 100m;
+    var unitAmount = (long)Math.Round(total * 100m, MidpointRounding.AwayFromZero);
+
+    // 3) створюємо сесію
+    var opts = new SessionCreateOptions
+    {
+        Mode = "payment",
+        LineItems = new()
+        {
+            new SessionLineItemOptions
+            {
+                Quantity = 1,
+                PriceData = new SessionLineItemPriceDataOptions
+                {
+                    Currency = "eur",
+                    UnitAmount = unitAmount,
+                    ProductData = new SessionLineItemPriceDataProductDataOptions
+                    {
+                        Name = $"Quote {data.q.Name}"
+                    }
+                }
+            }
+        },
+        SuccessUrl = $"http://localhost:5173/?pay=success&quoteId={id}&session_id={{CHECKOUT_SESSION_ID}}",
+        CancelUrl = $"http://localhost:5173/?pay=cancel&quoteId={id}",
+        Metadata = new Dictionary<string, string?>
+        {
+            ["userId"] = cur.Id.ToString(),
+            ["quoteId"] = id.ToString()
+        }
+    };
+
+    var session = await new Stripe.Checkout.SessionService().CreateAsync(opts, null, ct);
+
+    // 4) зберігаємо
+    data.q.PaymentUrl = session.Url;
+    data.q.PaymentSessionId = session.Id;
+    data.q.PaymentStatus = "pending";
+    await db.SaveChangesAsync(ct);
+
+    return Results.Ok(new { url = session.Url });
+});
+
 quoteMap.MapGet("/{id:guid}", async(Guid id, GetQuoteByIdQuery query) => {
     var quote = await query.Handle(id, CancellationToken.None);
     return Results.Ok(quote);
 });
 
-quoteMap.MapGet("/{id:guid}/pdf", async (Guid id, QuotePdfService service, CancellationToken ct) =>
+quoteMap.MapPost("/confirm", async (
+    string session_id,
+    EstimoDbContext db,
+    ICurrentUser cur,
+    CancellationToken ct) =>
 {
+    if (string.IsNullOrWhiteSpace(session_id)) return Results.BadRequest();
+
+    var svc = new SessionService();
+    var sess = await svc.GetAsync(session_id,
+        options: null, requestOptions: null, cancellationToken: ct);
+
+    var status = sess.Status?.ToString();
+    var payment = sess.PaymentStatus?.ToString();
+    if (!string.Equals(status, "complete", StringComparison.OrdinalIgnoreCase) ||
+        !string.Equals(payment, "paid", StringComparison.OrdinalIgnoreCase))
+        return Results.BadRequest(new { error = "Not paid" });
+
+    // знайдемо квоту за session_id + перевіримо власника
+    var quote = await (from q in db.Quotes
+                       join c in db.Clients on q.ClientId equals c.Id
+                       where q.PaymentSessionId == session_id && c.OwnerId == cur.Id
+                       select q).FirstOrDefaultAsync(ct);
+    if (quote is null) return Results.Forbid();
+
+    quote.PaymentStatus = "paid";
+    await db.SaveChangesAsync(ct);
+
+    return Results.Ok(new { ok = true });
+}).RequireAuthorization();
+
+quoteMap.MapGet("/{id:guid}/pdf", async (Guid id, QuotePdfService service, EstimoDbContext db, ICurrentUser user, CancellationToken ct) =>
+{
+    var (ok, _) = await CanGenerateAsync(db, user.Id, ct);
+    if (!ok) return Results.StatusCode(429);
+
     var pdf = await service.GeneratePdfAsync(id, ct);
+
+    await QuotePdfService.CommitGenerateAsync(db, user.Id, ct);   // <-- зберігає всередині
     return Results.File(pdf, "application/pdf", $"quote-{id.ToString()[..8]}.pdf");
 });
 
+billing.MapPost("/checkout", async (CheckoutReq req, HttpContext ctx) =>
+{
+    var plan = (req.Plan ?? "pro").ToLowerInvariant();
+    if (plan != "pro" && plan != "business") plan = "pro";
+
+    var userId = ctx.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? ctx.User.FindFirstValue("sub");
+    if (!Guid.TryParse(userId, out var uid)) return Results.Unauthorized();
+
+    // ціни (у центах/копійках)
+    var (amount, name) = plan == "business" ? (2900L, "Business (monthly)") : (900L, "Pro (monthly)");
+
+    var options = new SessionCreateOptions
+    {
+        Mode = "subscription",
+        LineItems = new()
+        {
+            new SessionLineItemOptions
+            {
+                Quantity = 1,
+                PriceData = new SessionLineItemPriceDataOptions
+                {
+                    Currency = "eur",
+                    UnitAmount = amount,
+                    Recurring = new SessionLineItemPriceDataRecurringOptions { Interval = "month", IntervalCount = 1 },
+                    ProductData = new SessionLineItemPriceDataProductDataOptions { Name = name }
+                }
+            }
+        },
+        SuccessUrl = $"http://localhost:5173/?billing=success&plan={plan}&session_id={{CHECKOUT_SESSION_ID}}",
+        CancelUrl = $"http://localhost:5173/?billing=cancel",
+        Metadata = new Dictionary<string, string?>
+        {
+            ["userId"] = uid.ToString(),
+            ["plan"] = plan
+        }
+    };
+
+    var session = await new SessionService().CreateAsync(options);
+    return Results.Ok(new { url = session.Url });
+});
+
+billing.MapPost("/confirm", async (
+    string session_id,
+    ICurrentUser cur,
+    EstimoDbContext db,
+    CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(session_id))
+        return Results.BadRequest();
+
+    var svc = new SessionService();
+    var sess = await svc.GetAsync(
+        session_id,
+        options: new SessionGetOptions { Expand = new List<string> { "subscription" } },
+        requestOptions: null,
+        cancellationToken: ct);
+
+    // Узгоджено для різних версій Stripe.NET
+    var status = sess.Status?.ToString();
+    var payment = sess.PaymentStatus?.ToString();
+
+    if (!string.Equals(status, "complete", StringComparison.OrdinalIgnoreCase) ||
+        !string.Equals(payment, "paid", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest(new { error = $"Session not completed/paid (status={status}, payment={payment})" });
+    }
+
+    // Перевірка власника
+    if (!sess.Metadata.TryGetValue("userId", out var metaUser) ||
+        !Guid.TryParse(metaUser, out var owner) ||
+        owner != cur.Id)
+    {
+        return Results.Forbid();
+    }
+
+    var plan = (sess.Metadata.TryGetValue("plan", out var p) ? p : "pro")!
+        .ToLowerInvariant();
+
+    // ---- Обережно дістаємо період, інакше fallback +1 місяць ----
+    DateTime? periodEnd = null;
+
+    try
+    {
+        // у різних версіях є або SubscriptionId, або вже розгорнутий Subscription
+        var subId = !string.IsNullOrWhiteSpace(sess.SubscriptionId)
+            ? sess.SubscriptionId
+            : sess.Subscription?.Id;
+
+        if (!string.IsNullOrWhiteSpace(subId))
+        {
+            var subSvc = new Stripe.SubscriptionService();
+            var sub = await subSvc.GetAsync(subId!, options: null, requestOptions: null, cancellationToken: ct);
+
+            // без прив’язки до конкретного типу властивості
+            var prop = sub.GetType().GetProperty("CurrentPeriodEnd");
+            if (prop != null)
+            {
+                var val = prop.GetValue(sub);
+                if (val is DateTime dt) periodEnd = dt.ToUniversalTime();
+                else if (val is long unix) periodEnd = DateTimeOffset.FromUnixTimeSeconds(unix).UtcDateTime;
+            }
+        }
+    }
+    catch { /* ок для MVP */ }
+
+    periodEnd ??= DateTime.UtcNow.AddMonths(1); // fallback
+
+    var bill = await db.UserBillings.FindAsync(new object[] { cur.Id }, ct)
+               ?? new UserBilling { UserId = cur.Id };
+
+    bill.Plan = (plan == "business" || plan == "pro") ? plan : "pro";
+    bill.CurrentPeriodEndUtc = periodEnd;
+
+    db.UserBillings.Update(bill);
+    await db.SaveChangesAsync(ct);
+
+    return Results.Ok(new { plan = bill.Plan, periodEnd = bill.CurrentPeriodEndUtc });
+}).RequireAuthorization();
+
+
+
+billing.MapGet("/success", () => Results.Ok(new { ok = true }));
+billing.MapGet("/cancel", () => Results.Ok(new { canceled = true }));
 
 app.Run();
 
@@ -211,3 +490,5 @@ app.Run();
 record RegisterRequest(string Email, string Password, string confPassword);
 record LoginRequest(string Email, string Password);
 record AuthResponse(string AccessToken, DateTime ExpiresAtUtc, string? UserId = null);
+record CheckoutReq(string Plan);
+

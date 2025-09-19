@@ -14,5 +14,7 @@ public class Quote
 
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
-    public decimal Total => Amount + (Amount * VatPercent / 100m);
+    public string? PaymentUrl { get; set; }           // <— нове
+    public string? PaymentSessionId { get; set; }     // <— нове (для confirm)
+    public string PaymentStatus { get; set; } = "new";// new|pending|paid|canceled
 }

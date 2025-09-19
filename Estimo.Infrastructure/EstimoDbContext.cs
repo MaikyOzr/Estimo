@@ -10,6 +10,8 @@ public class EstimoDbContext : DbContext
     public DbSet<User> Users => Set<User>();
     public DbSet<Client> Clients => Set<Client>();
     public DbSet<Quote> Quotes => Set<Quote>();
+    public DbSet<UserBilling> UserBillings => Set<UserBilling>();
+    public DbSet<UserUsage> UserUsages => Set<UserUsage>();
     protected override void OnModelCreating(ModelBuilder b)
     {
         b.Entity<Client>().HasIndex(x => x.OwnerId);
@@ -27,5 +29,7 @@ public class EstimoDbContext : DbContext
             e.Property(x => x.PasswordHash).IsRequired();
             e.HasIndex(x => x.EmailNormalized).IsUnique();
         });
+        b.Entity<UserBilling>().HasKey(x => x.UserId);
+        b.Entity<UserUsage>().HasKey(x => x.UserId);
     }
 }

@@ -5,7 +5,6 @@ using Estimo.Infrastructure;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 
-
 namespace Estimo.Application.Features.Quote.Command;
 
 public sealed class CreateQuoteCommand(EstimoDbContext _context, ICurrentUser currentUser) : IRequestHandler<CreateQuoteRequest, CreateQuoteResponse>
@@ -16,9 +15,12 @@ public sealed class CreateQuoteCommand(EstimoDbContext _context, ICurrentUser cu
             .FirstOrDefaultAsync(x=> x.Id == request.clientId && x.OwnerId == currentUser.Id) 
             ?? throw new Exception("Client not found!");
 
+        var defaultQuoteName= string.IsNullOrWhiteSpace(request.name)
+            ? $"Quote for {client.Name} - {DateTime.UtcNow:yyyyMMddHHmmss}" : request.name;
+
         var quote = new Domain.Quote
         {
-            Name = request.name,
+            Name = defaultQuoteName,
             ClientId = request.clientId,
             VatPercent = request.vatPercent,
             Amount = request.amount,
