@@ -42,7 +42,13 @@
 ---
 
 ## 📸 Screenshots (MVP UI)
-*(add your screenshots here – auth panel, create client, create quote, PDF preview, Stripe checkout)*
+<img width="1113" height="521" alt="image" src="https://github.com/user-attachments/assets/47825d8e-603b-49ec-932c-95768da6b2b5" />
+<img width="1082" height="575" alt="image" src="https://github.com/user-attachments/assets/b5bcfd96-131c-4865-b83f-ffe50eeaa80b" />
+<img width="1102" height="371" alt="image" src="https://github.com/user-attachments/assets/4fbf573a-09d4-4d4a-8ae1-0fd0bb464750" />
+<img width="1112" height="452" alt="image" src="https://github.com/user-attachments/assets/8fecf9a2-21a1-4e69-8ab8-216f913200be" />
+<img width="776" height="406" alt="image" src="https://github.com/user-attachments/assets/acb9c773-25c8-464b-9fa8-9d65045be0d3" />
+<img width="1920" height="946" alt="image" src="https://github.com/user-attachments/assets/310b6e3e-60fa-43ad-80c3-b72167e6c1c4" />
+
 
 ---
 
